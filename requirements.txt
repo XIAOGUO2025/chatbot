@@ -1,15 +1,8 @@
-# ---- 必需 ----
-torch>=1.10
-requests>=2.25
-
-# ---- 文档上传 ----
-pypdf>=3.0
-python-docx>=0.8
-
-# ---- 向量检索 ----
-sentence-transformers>=2.2
-faiss-cpu>=1.7
-numpy>=1.21
-
-# ---- 大模型（可选） ----
-openai>=1.0.0
+torch
+requests
+sentence-transformers
+faiss-cpu
+numpy
+pypdf
+python-docx
+openai

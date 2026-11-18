@@ -1,41 +1,19 @@
-# ---- Python ----
+# Python 编译缓存
 __pycache__/
 *.py[cod]
-*.egg-info/
-.pytest_cache/
 
-# ---- 虚拟环境 ----
-venv/
+# 虚拟环境
 .venv/
-env/
+venv/
 
-# ---- 模型与缓存 ----
+# 模型权重文件 (体积太大，不上传)
 *.pt
 *.pth
 *.bin
-*.safetensors
-.cache/
-huggingface/
-sentence_transformers/
 
-# ---- 环境变量与密钥 ----
-.env
-.env.*
-*.key
+# 包含私人数据的知识库 (如果你希望上传示例，这行可以删掉)
+# knowledge.txt
 
-# ---- 知识库与上传文档 ----
-# knowledge.txt 里可能有你上传的私有文档，默认不提交
-knowledge.txt
-uploads/
-*.pdf
-*.docx
-
-# ---- 日志与临时文件 ----
-*.log
-history.jsonl
+# 系统文件
 .DS_Store
 Thumbs.db
-
-# ---- IDE ----
-.idea/
-.vscode/
