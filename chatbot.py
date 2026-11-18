@@ -1,17 +1,21 @@
 """
-完整对话助手（带防乱说机制）：
-  - 天气工具（Open-Meteo API，支持多轮城市指代）
-  - 知识库 RAG（纯文本 knowledge.txt，字符 bigram TF-IDF）
-  - 三态检索：hit / weak / miss，没证据不硬答
-  - 知识类问题拒答：知识库没有可靠信息时明确说不知道
-  - 引用校验（可选）：大模型回答后再核对是否被资料支持
+完整对话助手（合并版）：
+  - 天气工具（Open-Meteo，支持多轮城市指代）
+  - 时间工具 / 计算器工具（确定性回答，不经过模型）
+  - 知识库 RAG（向量检索优先，TF-IDF 回退）
+  - 三态检索：hit / weak / miss
+  - 知识类拒答：没证据不硬答
+  - 引用校验（可选）
+  - 文档上传：PDF / Word / Markdown / TXT → 追加知识库
   - 本地 Seq2Seq（带置信度拒答，单轮兜底）
+  - 可选大模型后端（DeepSeek / OpenAI，支持多轮）
   - 会话上下文 ChatSession
 
 运行:
     pip install torch requests
-    pip install openai          # 可选，用于大模型后端和引用校验
-    python chatbot_rag.py
+    pip install pypdf python-docx                       # 文档上传
+    pip install sentence-transformers faiss-cpu         # 向量检索
+    pip install openai                                  # 大模型（可选）
 
 环境变量（可选）:
     DEEPSEEK_API_KEY=...
@@ -23,6 +27,7 @@ import random
 import re
 import time
 from collections import Counter
+from datetime import datetime
 
 import requests
 import torch
@@ -40,11 +45,19 @@ DEFAULT_CITY = "北京"
 KNOWLEDGE_FILE = "knowledge.txt"
 
 RAG_TOP_K = 3
-RAG_SCORE_MISS = 0.10      # 低于此视为完全无关
-RAG_SCORE_HIT = 0.25       # 高于此视为可靠命中；中间为 weak
 
-ENABLE_VERIFY = False      # True 时对 RAG 回答做引用校验（多一次大模型调用）
-LOCAL_CONF_THRESHOLD = 0.5  # 本地模型平均置信度低于此值则拒答
+# TF-IDF 阈值（向量检索不可用时使用）
+RAG_SCORE_MISS_TFIDF = 0.10
+RAG_SCORE_HIT_TFIDF = 0.25
+# 向量检索阈值（余弦相似度）
+RAG_SCORE_MISS_VEC = 0.35
+RAG_SCORE_HIT_VEC = 0.55
+
+USE_VECTOR_RETRIEVAL = True
+VECTOR_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+
+ENABLE_VERIFY = False
+LOCAL_CONF_THRESHOLD = 0.5
 
 LLM_BACKEND = "deepseek" if os.environ.get("DEEPSEEK_API_KEY") else (
     "openai" if os.environ.get("OPENAI_API_KEY") else None
@@ -52,6 +65,8 @@ LLM_BACKEND = "deepseek" if os.environ.get("DEEPSEEK_API_KEY") else (
 
 WEATHER_KEYS = ["天气", "气温", "温度", "下雨", "下雪", "刮风",
                 "冷不冷", "热不热", "穿什么"]
+
+TIME_KEYS = ["几点", "时间", "几号", "日期", "星期几", "周几", "今天几"]
 
 PRONOUNS = ["它", "他", "她", "这个", "那个", "这", "那",
             "再", "还", "另外", "上面", "前面", "呢"]
@@ -61,7 +76,7 @@ EXCLUDE_WEATHER_FOLLOWUP = ["国家", "首都", "属于", "在哪", "是谁",
 
 KNOWLEDGE_HINTS = ["怎么", "如何", "多少", "几天", "流程", "政策",
                    "规定", "是什么", "能不能", "可不可以", "怎么办",
-                   "为什么", "几天", "几天假", "标准", "制度"]
+                   "为什么", "标准", "制度"]
 
 REFUSE_TEXT = "这个问题我知识库里没有可靠信息，不敢乱说。你可以补充一下背景，或者换个问法。"
 
@@ -162,21 +177,6 @@ def is_weather_intent(text):
     return any(k in text for k in WEATHER_KEYS)
 
 
-def is_weather_followup(text, session=None):
-    if session is None or not session.history:
-        return False
-    prev_users = session.recent_user_texts(2)
-    if not prev_users or not any(is_weather_intent(p) for p in prev_users):
-        return False
-    if any(w in text for w in EXCLUDE_WEATHER_FOLLOWUP):
-        return False
-    if extract_city(text):
-        return len(text) <= 12
-    if len(text) <= 8 and any(p in text for p in ["那", "呢", "怎么样", "如何", "多少"]):
-        return True
-    return False
-
-
 def extract_city(text):
     known = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉",
              "西安", "南京", "重庆", "天津", "苏州", "长沙", "郑州",
@@ -205,6 +205,21 @@ def extract_city_with_ctx(text, session=None):
     return None
 
 
+def is_weather_followup(text, session=None):
+    if session is None or not session.history:
+        return False
+    prev_users = session.recent_user_texts(2)
+    if not prev_users or not any(is_weather_intent(p) for p in prev_users):
+        return False
+    if any(w in text for w in EXCLUDE_WEATHER_FOLLOWUP):
+        return False
+    if extract_city(text):
+        return len(text) <= 12
+    if len(text) <= 8 and any(p in text for p in ["那", "呢", "怎么样", "如何", "多少"]):
+        return True
+    return False
+
+
 def answer_weather(text, session=None, default_city=DEFAULT_CITY):
     city = extract_city_with_ctx(text, session) or default_city
     info = get_weather(city)
@@ -216,7 +231,66 @@ def answer_weather(text, session=None, default_city=DEFAULT_CITY):
 
 
 # ============================================================
-# 3. 知识库 RAG（三态检索）
+# 2.5 时间工具 & 计算器工具
+# ============================================================
+def is_time_intent(text):
+    return any(k in text for k in TIME_KEYS)
+
+
+def answer_time(text):
+    now = datetime.now()
+    if "几点" in text or "时间" in text:
+        return f"现在是 {now:%H:%M}。"
+    if "几号" in text or "日期" in text:
+        return f"今天是 {now:%Y年%m月%d日}。"
+    if "星期" in text or "周几" in text:
+        return f"今天是星期{'一二三四五六日'[now.weekday()]}。"
+    return f"现在是 {now:%Y-%m-%d %H:%M}。"
+
+
+CALC_PATTERN = r"[\d\.\+\-\*/\(\)\s]+"
+
+
+def is_calc_intent(text):
+    if is_time_intent(text):
+        return False
+    has_digit = any(ch.isdigit() for ch in text)
+    has_op = any(op in text for op in ["+", "-", "*", "/", "×", "÷",
+                                       "加", "减", "乘", "除"])
+    return has_digit and has_op
+
+
+def answer_calc(text):
+    """安全求值：只允许数字、括号、四则运算符"""
+    expr = text.replace("×", "*").replace("÷", "/")
+    expr = expr.replace("除以", "/").replace("乘以", "*")
+    expr = expr.replace("加上", "+").replace("减去", "-")
+    expr = expr.replace("加", "+").replace("减", "-")
+    expr = expr.replace("乘", "*").replace("除", "/")
+    expr = expr.replace("等于多少", "").replace("等于", "").replace("计算", "")
+    expr = expr.replace("算一下", "").replace("算算", "").replace("多少", "")
+
+    m = re.search(CALC_PATTERN, expr)
+    if not m:
+        return "没识别出算式，请用类似“3+5*2”的写法。"
+    raw = m.group().strip()
+    if not raw or not re.fullmatch(CALC_PATTERN, raw):
+        return "算式里有不支持的字符，我只支持 + - * / 和括号。"
+    if not any(ch.isdigit() for ch in raw):
+        return "算式里没有数字，请重新输入。"
+
+    try:
+        result = eval(raw, {"__builtins__": {}}, {})
+    except Exception:
+        return "这个算式我算不出来，检查一下括号和运算符。"
+
+    if isinstance(result, float) and result.is_integer():
+        result = int(result)
+    return f"{raw} = {result}"
+
+
+# ============================================================
+# 3. 知识库 RAG（TF-IDF + 向量检索）
 # ============================================================
 SAMPLE_KB = """公司年假制度
 员工入职满一年享有 5 天带薪年假，满三年享有 10 天，满五年享有 15 天。
@@ -278,6 +352,53 @@ _KB_CHUNKS = []
 _KB_VECTORS = []
 _KB_IDF = {}
 
+# 向量后端
+_VEC_MODEL = None
+_FAISS_INDEX = None
+_VEC_DIM = None
+_VEC_FAILED = False
+
+
+def init_vector_backend():
+    global _VEC_MODEL, _FAISS_INDEX, _VEC_DIM, _VEC_FAILED
+    if not USE_VECTOR_RETRIEVAL or _VEC_FAILED:
+        return False
+    if _VEC_MODEL is not None and _FAISS_INDEX is not None:
+        return True
+    try:
+        import faiss
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        print("[向量检索] 未安装 sentence-transformers / faiss-cpu，回退 TF-IDF")
+        _VEC_FAILED = True
+        return False
+
+    try:
+        print(f"[向量检索] 正在加载模型 {VECTOR_MODEL_NAME} ...")
+        _VEC_MODEL = SentenceTransformer(VECTOR_MODEL_NAME)
+        _VEC_DIM = _VEC_MODEL.get_sentence_embedding_dimension()
+        _FAISS_INDEX = faiss.IndexFlatIP(_VEC_DIM)
+        print(f"[向量检索] 模型加载完成，维度 {_VEC_DIM}")
+        return True
+    except Exception as e:
+        print(f"[向量检索] 模型加载失败: {type(e).__name__}: {e}")
+        _VEC_MODEL = None
+        _VEC_FAILED = True
+        return False
+
+
+def rebuild_vector_index():
+    global _FAISS_INDEX
+    if not init_vector_backend() or not _KB_CHUNKS:
+        return
+    import faiss
+    import numpy as np
+    vecs = _VEC_MODEL.encode(
+        _KB_CHUNKS, normalize_embeddings=True, show_progress_bar=False)
+    _FAISS_INDEX = faiss.IndexFlatIP(_VEC_DIM)
+    _FAISS_INDEX.add(np.asarray(vecs, dtype="float32"))
+    print(f"[向量检索] 索引已重建，{_FAISS_INDEX.ntotal} 条")
+
 
 def init_knowledge(path=KNOWLEDGE_FILE):
     global _KB_CHUNKS, _KB_VECTORS, _KB_IDF
@@ -285,16 +406,40 @@ def init_knowledge(path=KNOWLEDGE_FILE):
     _KB_CHUNKS = split_chunks(text)
     _KB_VECTORS, _KB_IDF = build_tfidf(_KB_CHUNKS)
     print(f"[知识库] 加载 {len(_KB_CHUNKS)} 个知识块")
+    rebuild_vector_index()
+
+
+def retrieve_vector(query, top_k=RAG_TOP_K):
+    if _VEC_MODEL is None or _FAISS_INDEX is None or _FAISS_INDEX.ntotal == 0:
+        return []
+    import numpy as np
+    qv = _VEC_MODEL.encode([query], normalize_embeddings=True,
+                           show_progress_bar=False)
+    scores, idxs = _FAISS_INDEX.search(np.asarray(qv, dtype="float32"), top_k)
+    out = []
+    for s, i in zip(scores[0], idxs[0]):
+        if i < 0:
+            continue
+        out.append((float(s), _KB_CHUNKS[i]))
+    return out
 
 
 def retrieve(query, top_k=RAG_TOP_K):
     if not _KB_CHUNKS:
         return []
+
+    if USE_VECTOR_RETRIEVAL and init_vector_backend():
+        if _FAISS_INDEX is None or _FAISS_INDEX.ntotal == 0:
+            rebuild_vector_index()
+        vec_results = retrieve_vector(query, top_k)
+        if vec_results:
+            return vec_results
+
+    # ---- 回退：TF-IDF ----
     q = Counter(char_bigrams(query))
     qvec = {t: tf * _KB_IDF.get(t, 1.0) for t, tf in q.items()}
     norm = math.sqrt(sum(v * v for v in qvec.values())) or 1.0
     qvec = {t: v / norm for t, v in qvec.items()}
-
     scored = []
     for i, vec in enumerate(_KB_VECTORS):
         s = sum(qvec.get(t, 0.0) * v for t, v in vec.items())
@@ -303,25 +448,28 @@ def retrieve(query, top_k=RAG_TOP_K):
     return scored[:top_k]
 
 
+def get_rag_thresholds():
+    """根据当前检索模式返回 (miss_th, hit_th)"""
+    if USE_VECTOR_RETRIEVAL and _VEC_MODEL is not None:
+        return RAG_SCORE_MISS_VEC, RAG_SCORE_HIT_VEC
+    return RAG_SCORE_MISS_TFIDF, RAG_SCORE_HIT_TFIDF
+
+
 def answer_rag(query, original_text=None, use_llm=True, history=None):
-    """
-    返回 (status, answer, context)：
-      - "hit"  : 有可靠证据，answer 是回答
-      - "weak" : 相关但不够确定，answer 是澄清问句
-      - "miss" : 无证据，answer 为 None
-    """
     results = retrieve(query)
     if not results:
         return "miss", None, ""
 
+    miss_th, hit_th = get_rag_thresholds()
     top_score, top_chunk = results[0]
-    if top_score < RAG_SCORE_MISS:
+
+    if top_score < miss_th:
         return "miss", None, ""
-    if top_score < RAG_SCORE_HIT:
+    if top_score < hit_th:
         title = top_chunk.splitlines()[0] if top_chunk else "相关内容"
         return "weak", f"我不太确定，你是想问“{title}”相关的内容吗？", top_chunk
 
-    context = "\n\n".join(c for s, c in results if s >= RAG_SCORE_MISS)
+    context = "\n\n".join(c for s, c in results if s >= miss_th)
     question = original_text or query
 
     if use_llm and _LLM_CLIENT is not None:
@@ -342,13 +490,72 @@ def answer_rag(query, original_text=None, use_llm=True, history=None):
 
 
 # ============================================================
+# 3.5 文档上传：PDF / Word / Markdown / TXT
+# ============================================================
+def extract_text_from_file(path):
+    if not os.path.exists(path):
+        return None
+    lower = path.lower()
+
+    try:
+        if lower.endswith(".pdf"):
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            return "\n".join((p.extract_text() or "") for p in reader.pages)
+        if lower.endswith(".docx"):
+            from docx import Document
+            doc = Document(path)
+            return "\n".join(p.text for p in doc.paragraphs)
+        if lower.endswith((".md", ".txt")):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+    except Exception as e:
+        print(f"[文档解析失败] {path}: {type(e).__name__}: {e}")
+        return None
+    return None
+
+
+def clean_doc_text(text):
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def append_to_knowledge(text, source_name="uploaded"):
+    if not text:
+        return 0
+    chunks = split_chunks(clean_doc_text(text))
+    if not chunks:
+        return 0
+
+    with open(KNOWLEDGE_FILE, "a", encoding="utf-8") as f:
+        f.write("\n\n")
+        for c in chunks:
+            f.write(f"【来源：{source_name}】\n{c}\n\n")
+
+    init_knowledge(KNOWLEDGE_FILE)
+    return len(chunks)
+
+
+def upload_document(path, source_name=None):
+    if not os.path.exists(path):
+        return f"文件不存在：{path}"
+    text = extract_text_from_file(path)
+    if not text or not text.strip():
+        return f"没能从 {path} 提取到文本，可能是扫描版或空文件。"
+    name = source_name or os.path.basename(path)
+    n = append_to_knowledge(text, name)
+    return f"已从 {name} 导入 {n} 个知识块，当前知识库共 {len(_KB_CHUNKS)} 块。"
+
+
+# ============================================================
 # 4. 本地 Seq2Seq 模型
 # ============================================================
 DATA = [
     ("你好", "你好呀！我是小智，有什么可以帮你的吗？"),
     ("你是谁", "我是小智，一个对话助手。"),
     ("你叫什么名字", "我叫小智，很高兴认识你。"),
-    ("你会做什么", "我可以查天气、查知识库、陪你聊天。"),
+    ("你会做什么", "我可以查天气、查时间、算数、查知识库、陪你聊天。"),
     ("谢谢", "不客气，能帮到你就好！"),
     ("再见", "再见，期待下次和你聊天。"),
     ("我很难过", "抱抱你，愿意跟我说说发生了什么吗？"),
@@ -356,7 +563,6 @@ DATA = [
     ("推荐一部电影", "可以看看《心灵奇旅》，温暖又治愈。"),
     ("你喜欢什么颜色", "我偏爱蓝色，像深夜的天空。"),
     ("北京是哪个国家的", "北京是中国的首都。"),
-    ("1加1等于几", "等于2呀。"),
     ("什么是人工智能", "人工智能就是让机器模拟人类的智能行为。"),
     ("早上好", "早上好！今天也要元气满满哦。"),
     ("晚安", "晚安，做个好梦。"),
@@ -470,7 +676,6 @@ def train_local(model, epochs=300, batch_size=8, lr=1e-3, verbose_every=100):
 
 @torch.no_grad()
 def local_chat_with_conf(text, model, max_len=40):
-    """返回 (answer, confidence)"""
     if not text.strip():
         return "你好像什么都没说，想聊点什么呢？", 1.0
     model.eval()
@@ -546,7 +751,6 @@ def llm_chat(prompt, history=None):
 
 
 def verify_answer(question, context, answer):
-    """引用校验：回答是否被资料支持。无大模型时默认通过"""
     if _LLM_CLIENT is None:
         return True
     prompt = (
@@ -565,11 +769,19 @@ def chat_response(text, local_model=None, use_llm=True, session=None):
     if not text or not text.strip():
         return "你好像什么都没说，想聊点什么呢？"
 
-    # 1) 天气（含上下文追问）
+    # 1) 时间
+    if is_time_intent(text):
+        return answer_time(text)
+
+    # 2) 计算器
+    if is_calc_intent(text):
+        return answer_calc(text)
+
+    # 3) 天气（含上下文追问）
     if is_weather_intent(text) or is_weather_followup(text, session):
         return answer_weather(text, session=session)
 
-    # 2) 知识库 RAG（三态）
+    # 4) 知识库 RAG（三态）
     rag_query = build_rag_query(text, session)
     status, rag_ans, _ = answer_rag(
         rag_query,
@@ -581,20 +793,19 @@ def chat_response(text, local_model=None, use_llm=True, session=None):
         return rag_ans
     if status == "weak":
         return rag_ans
-    # status == "miss" 继续往下走
 
-    # 3) 知识类问题但知识库没命中 → 明确拒答
+    # 5) 知识类问题但知识库没命中 → 明确拒答
     if is_knowledge_like(text):
         return REFUSE_TEXT
 
-    # 4) 大模型（带历史）
+    # 6) 大模型（带历史）
     if use_llm and _LLM_CLIENT is not None:
         ans = llm_chat(text, history=session.as_messages()
                        if session else None)
         if ans:
             return ans
 
-    # 5) 本地 Seq2Seq（带置信度拒答）
+    # 7) 本地 Seq2Seq（带置信度拒答）
     if local_model is not None:
         ans, conf = local_chat_with_conf(text, local_model)
         return ans
@@ -605,6 +816,8 @@ def chat_response(text, local_model=None, use_llm=True, session=None):
 # ============================================================
 # 7. 测试数据与测试函数
 # ============================================================
+TEST_TIME = ["现在几点", "今天几号", "今天星期几", "现在时间"]
+TEST_CALC = ["3加5等于多少", "12*8", "(3+5)*2", "100除以4", "7乘6"]
 TEST_WEATHER = ["今天北京天气怎么样", "上海下雨吗", "广州气温多少"]
 TEST_RAG = ["年假有几天", "怎么退货", "公司几点上班", "报销流程是什么",
             "出差回来怎么报销", "入职一年有多少天年假"]
@@ -630,7 +843,7 @@ def run_group(name, questions, model, session=None):
 
 
 def run_multiturn_test(model):
-    print(f"\n{'=' * 52}\nF. 多轮上下文测试\n{'=' * 52}")
+    print(f"\n{'=' * 52}\nG. 多轮上下文测试\n{'=' * 52}")
     s = ChatSession(max_turns=6)
     turns = [
         "年假有几天",
@@ -657,11 +870,16 @@ if __name__ == "__main__":
     print(f"词表大小: {len(VOCAB)}")
     print(f"大模型后端: {LLM_BACKEND or '未配置'}")
     print(f"引用校验: {'开启' if ENABLE_VERIFY else '关闭'}")
+    print(f"向量检索: {'开启' if USE_VECTOR_RETRIEVAL else '关闭'}")
     print(
-        f"RAG 阈值: miss<{RAG_SCORE_MISS}  weak<{RAG_SCORE_HIT}  hit>={RAG_SCORE_HIT}")
+        f"TF-IDF 阈值: miss<{RAG_SCORE_MISS_TFIDF}  hit>={RAG_SCORE_HIT_TFIDF}")
+    print(f"向量阈值:   miss<{RAG_SCORE_MISS_VEC}  hit>={RAG_SCORE_HIT_VEC}")
 
     init_llm()
     init_knowledge(KNOWLEDGE_FILE)
+
+    miss_th, hit_th = get_rag_thresholds()
+    print(f"[RAG] 实际使用阈值: miss<{miss_th}  hit>={hit_th}")
 
     print("\n开始训练本地 Seq2Seq（兜底用）...")
     local_model = Seq2Seq(len(VOCAB), emb=128, hid=256)
@@ -670,6 +888,8 @@ if __name__ == "__main__":
                 lr=1e-3, verbose_every=100)
     print(f"本地模型训练完成，耗时 {time.time() - t0:.1f}s")
 
+    run_group("A2. 时间工具", TEST_TIME, local_model)
+    run_group("A3. 计算器工具", TEST_CALC, local_model)
     run_group("A. 天气工具", TEST_WEATHER, local_model)
     run_group("B. 知识库 RAG", TEST_RAG, local_model)
     run_group("C. 知识类拒答（应明确说不知道）", TEST_REFUSE, local_model)
@@ -679,7 +899,12 @@ if __name__ == "__main__":
 
     # ---- 交互模式 ----
     session = ChatSession(max_turns=6)
-    print(f"\n{'=' * 52}\n交互模式（输入 '退出' 结束）\n{'=' * 52}")
+    print(f"\n{'=' * 52}")
+    print("交互模式")
+    print("  - 输入问题直接对话")
+    print("  - 输入 '上传 文件路径'  上传文档（PDF/DOCX/MD/TXT）")
+    print("  - 输入 '退出' / 'exit' / 'quit' 结束")
+    print(f"{'=' * 52}")
     while True:
         try:
             q = input("你: ").strip()
@@ -690,6 +915,11 @@ if __name__ == "__main__":
             print("小智: 再见，期待下次和你聊天。")
             break
         if not q:
+            continue
+
+        if q.startswith("上传 "):
+            path = q[3:].strip()
+            print("小智:", upload_document(path))
             continue
 
         ans = chat_response(q, local_model=local_model, session=session)
