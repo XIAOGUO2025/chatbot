@@ -6,3 +6,4 @@ numpy
 pypdf
 python-docx
 openai
+streamlit
