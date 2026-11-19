@@ -1,5 +1,11 @@
 # config.py
 import os
+import sys
+
+# 判断是否是打包后的 EXE 运行环境
+if getattr(sys, 'frozen', False):
+    # 如果是 EXE，将工作目录切换到 EXE 所在的文件夹
+    os.chdir(os.path.dirname(sys.executable))
 
 DEFAULT_CITY = "北京"
 KNOWLEDGE_FILE = "knowledge.txt"

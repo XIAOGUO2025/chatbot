@@ -7,7 +7,6 @@ __pycache__/
 venv/
 
 # 模型权重文件 (体积太大，不上传)
-*.pt
 *.pth
 *.bin
 
